@@ -1,0 +1,23 @@
+# Local copyrighted game files and generated native code stay OFF GitHub.
+/local/
+*.3ds
+*.cia
+*.cxi
+*.cci
+*.3dsx
+*.sav
+**/target/
+**/__pycache__/
+*.log
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+.vs/
+.DS_Store
+# Never import upstream repositories' Git internals.
+**/.git/
+# Generated build trees
+/build/
+/dist/

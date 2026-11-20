@@ -1,0 +1,46 @@
+{
+  "generated_utc": "2026-11-20T09:23:37.007930+00:00",
+  "snapshots": {
+    "3dsrecomp": {
+      "repo": "https://github.com/fearkov/3dsrecomp",
+      "commit": "4b6de5d884b0d8bc337e16c07b84a0824e55a0e1",
+      "commit_date": "2026-11-17T02:54:33Z",
+      "archive": "local/source-archives/3dsrecomp-4b6de5d884b0d8bc337e16c07b84a0824e55a0e1.zip",
+      "sha256": "4967d3068af9c938723b96c30e9f9ea23215decc3370de3af15ff0be15af4202",
+      "extracted_files": 32,
+      "license": "MIT (declared by upstream)"
+    },
+    "zakuro": {
+      "repo": "https://github.com/fearkov/zakuro",
+      "commit": "fdf67b29b6398a7ad0dc2309b09ea4c03c45e9d8",
+      "commit_date": "2026-11-17T03:35:30Z",
+      "archive": "local/source-archives/zakuro-fdf67b29b6398a7ad0dc2309b09ea4c03c45e9d8.zip",
+      "sha256": "9a476fc524cdb7ed4a9809b26e7f392735e20c721b6cad09ac3e4c2eb92a5c58",
+      "extracted_files": 195,
+      "license": "MIT (declared by upstream)"
+    }
+  },
+  "rewrites": [
+    {
+      "manifest": "external/3dsrecomp/Cargo.toml",
+      "dependency": "zakuro-cpu",
+      "local_path": "../zakuro/crates/zakuro-cpu"
+    },
+    {
+      "manifest": "external/zakuro/Cargo.toml",
+      "dependency": "recomp-abi",
+      "local_path": "../3dsrecomp/abi"
+    },
+    {
+      "manifest": "external/zakuro/crates/zakuro/Cargo.toml",
+      "dependency": "recomp3ds",
+      "local_path": "../../../3dsrecomp"
+    }
+  ],
+  "notes": [
+    "No upstream .git metadata, submodules, or GitHub Actions included.",
+    "Cargo.lock files originate upstream; Cargo reconciles them on first local build.",
+    "Crates.io dependencies still require an initial Cargo download unless cached.",
+    "Use PORT_LOCAL.bat to keep the generated port linked to the local Zakuro snapshot."
+  ]
+}

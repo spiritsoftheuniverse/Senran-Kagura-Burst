@@ -1,0 +1,807 @@
+//! fragment lighting
+//! per pixel, the lights set up in the lighting registers shade the surface whose orientation the vertex shader
+//! hands over as a quaternion, and the combiners read the result as the primary (diffuse) and secondary (specular)
+//! fragment colors
+//! how each term comes out of the lookup tables follows what Citra worked out
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub const REG_ENABLE: usize = 0x08F;
+const REG_LIGHTS: usize = 0x140;
+const REG_GLOBAL_AMBIENT: usize = 0x1C0;
+const REG_LIGHT_COUNT: usize = 0x1C2;
+const REG_CONFIG0: usize = 0x1C3;
+const REG_CONFIG1: usize = 0x1C4;
+pub const REG_TABLE_INDEX: usize = 0x1C5;
+const REG_DISABLE: usize = 0x1C6;
+pub const REG_TABLE_DATA: usize = 0x1C8;
+pub const REG_TABLE_DATA_END: usize = 0x1CF;
+const REG_TABLE_ABSOLUTE: usize = 0x1D0;
+const REG_TABLE_INPUT: usize = 0x1D1;
+const REG_TABLE_SCALE: usize = 0x1D2;
+const REG_LIGHT_SLOTS: usize = 0x1D9;
+
+/// the tables, the specular distributions, fresnel, the reflections, plus a spotlight and a distance attenuation for each light
+const DISTRIBUTION0: usize = 0;
+const DISTRIBUTION1: usize = 1;
+const FRESNEL: usize = 3;
+const REFLECT_BLUE: usize = 4;
+const REFLECT_GREEN: usize = 5;
+const REFLECT_RED: usize = 6;
+const SPOTLIGHT: usize = 8;
+const DISTANCE: usize = 16;
+pub(crate) const TABLES: usize = 24;
+
+/// the lookup tables, each entry decoded as it arrives into its value and the step to the next entry, which interpolates between them
+pub struct Tables {
+    entries: Box<[[[f32; 2]; 256]; TABLES]>,
+    /// goes up w/ every write that changes an entry, so a copy elsewhere knows it's stale, titles send the same tables over and over
+    generation: u64,
+    /// the generation each table last changed at, so a copy elsewhere can tell which of its tables to look at again
+    changed: [u64; TABLES],
+    /// which tables these are, so a generation noted for these never gets taken for one of another set's
+    id: u64,
+}
+
+impl Default for Tables {
+    fn default() -> Self {
+        static IDS: AtomicU64 = AtomicU64::new(0);
+        Tables {
+            entries: Box::new([[[0.0; 2]; 256]; TABLES]),
+            generation: 0,
+            changed: [0; TABLES],
+            id: IDS.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Tables {
+    /// every entry, table after table, for a save state
+    pub(crate) fn saved(&self) -> Vec<[f32; 2]> {
+        self.entries.iter().flatten().copied().collect()
+    }
+
+    /// the entries a save state had, false when they don't fit
+    pub(crate) fn restore(&mut self, entries: &[[f32; 2]]) -> bool {
+        if entries.len() != TABLES * 256 {
+            return false;
+        }
+        for (table, saved) in self.entries.iter_mut().zip(entries.chunks(256)) {
+            table.copy_from_slice(saved);
+        }
+        self.generation += 1;
+        self.changed = [self.generation; TABLES];
+        true
+    }
+
+    /// takes a write to the table data registers, into the table and entry the index register names, which then moves on to the next entry
+    pub fn write(&mut self, registers: &mut [u32], value: u32) {
+        self.write_all(registers, [&[value], &[]]);
+    }
+
+    /// takes writes to the table data registers one after another like write does,
+    /// the index register read and moved on once for all of them
+    /// titles send whole tables, thousands of entries a frame, a command's first word and the burst after it,
+    /// plain loops over each whose count and entry stay in registers
+    /// an iterator's fold the compiler sometimes left out of line kept them in memory, each entry waiting on the last one's store
+    pub fn write_all(&mut self, registers: &mut [u32], parts: [&[u32]; 2]) {
+        let index = registers[REG_TABLE_INDEX];
+        let number = ((index >> 8) & 0x1F) as usize;
+        let mut entry = index as u8;
+        match self.entries.get_mut(number) {
+            Some(table) => {
+                let mut changes = 0;
+                for part in parts {
+                    for &value in part {
+                        // a 0.12 value and the step to the next one, an 11 bit magnitude w/ the sign above it
+                        let step = STEPS[((value >> 12) & 0x7FF) as usize];
+                        let step = if value & (1 << 23) != 0 { -step } else { step };
+                        let decoded = [VALUES[(value & 0xFFF) as usize], step];
+                        let slot = &mut table[entry as usize];
+                        changes += (slot.map(f32::to_bits) != decoded.map(f32::to_bits)) as u64;
+                        *slot = decoded;
+                        entry = entry.wrapping_add(1);
+                    }
+                }
+                if changes > 0 {
+                    self.generation += changes;
+                    self.changed[number] = self.generation;
+                }
+            }
+            None => entry = entry.wrapping_add((parts[0].len() + parts[1].len()) as u8),
+        }
+        registers[REG_TABLE_INDEX] = (index & !0xFF) | entry as u32;
+    }
+
+    /// every entry as a value and a step, table after table
+    pub(crate) fn entries(&self) -> &[[[f32; 2]; 256]; TABLES] {
+        &self.entries
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// the generation each table last changed at
+    pub(crate) fn changed(&self) -> &[u64; TABLES] {
+        &self.changed
+    }
+
+    /// which tables these are
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn lookup(&self, table: usize, entry: u8, delta: f32) -> f32 {
+        let [value, step] = self.entries[table][entry as usize];
+        value + step * delta
+    }
+}
+
+/// each 0.12 value of a table entry, as a float
+static VALUES: [f32; 4096] = {
+    let mut values = [0.0; 4096];
+    let mut i = 0;
+    while i < values.len() {
+        values[i] = i as f32 / 4095.0;
+        i += 1;
+    }
+    values
+};
+
+/// each magnitude of a step to the next entry, as a float
+static STEPS: [f32; 2048] = {
+    let mut steps = [0.0; 2048];
+    let mut i = 0;
+    while i < steps.len() {
+        steps[i] = i as f32 / 2047.0;
+        i += 1;
+    }
+    steps
+};
+
+/// a PICA float w/ the given mantissa and exponent widths, where a zero exponent isn't denormal, just the smallest one
+fn pica_float(bits: u32, mantissa: u32, exponent: u32) -> f32 {
+    let width = mantissa + exponent + 1;
+    let sign = (bits >> (mantissa + exponent)) << 31;
+    if bits & ((1 << (width - 1)) - 1) == 0 {
+        return f32::from_bits(sign);
+    }
+    let mut biased = (bits >> mantissa) & ((1 << exponent) - 1);
+    biased = if biased == (1 << exponent) - 1 { 255 } else { biased + 128 - (1 << (exponent - 1)) };
+    f32::from_bits(sign | ((bits & ((1 << mantissa) - 1)) << (23 - mantissa)) | (biased << 23))
+}
+
+/// a light color, three 10 bit fields where 255 means one
+fn color(value: u32) -> [f32; 3] {
+    [(value >> 20) & 0x3FF, (value >> 10) & 0x3FF, value & 0x3FF].map(|c| c as f32 / 255.0)
+}
+
+/// a component of a spotlight direction, a signed 1.11 fixed point number
+fn fixed(value: u32) -> f32 {
+    (((value & 0x1FFF) as i32) << 19 >> 19) as f32 / 2047.0
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn normalized(v: [f32; 3]) -> [f32; 3] {
+    let length = dot(v, v).sqrt();
+    v.map(|c| c / length)
+}
+
+/// v turned by the unit quaternion q
+fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let axis = [q[0], q[1], q[2]];
+    let inner = cross(axis, v);
+    let turn = cross(axis, std::array::from_fn(|i| inner[i] + v[i] * q[3]));
+    std::array::from_fn(|i| v[i] + 2.0 * turn[i])
+}
+
+/// which tables a lighting configuration has room for
+fn supported(config: u32, table: usize) -> bool {
+    match table {
+        DISTRIBUTION0 => config != 1,
+        DISTRIBUTION1 => !matches!(config, 0 | 1 | 5),
+        SPOTLIGHT => !matches!(config, 2 | 3),
+        FRESNEL => !matches!(config, 0 | 2 | 4),
+        REFLECT_RED => config != 3,
+        _ => matches!(config, 4 | 5 | 8),
+    }
+}
+
+/// how a table gets read, the dot product it takes, if that's taken as its absolute value, and the scale on the result
+#[derive(Debug, Clone, Copy)]
+struct Lookup {
+    input: u32,
+    absolute: bool,
+    scale: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Light {
+    specular0: [f32; 3],
+    specular1: [f32; 3],
+    diffuse: [f32; 3],
+    ambient: [f32; 3],
+    position: [f32; 3],
+    /// the unit vector toward a directional light
+    direction: [f32; 3],
+    /// the inverse spotlight direction
+    spot: [f32; 3],
+    directional: bool,
+    two_sided: bool,
+    geometric0: bool,
+    geometric1: bool,
+    /// bias and scale into the light's distance table, when it has one
+    distance: Option<(f32, f32)>,
+    spotlight: bool,
+    shadowed: bool,
+    /// which light it is, that picks its spotlight and distance tables
+    number: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Bump {
+    None,
+    /// the texture unit holding the normals, and if z gets rebuilt
+    Normal(usize, bool),
+    Tangent(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Shadow {
+    unit: usize,
+    invert: bool,
+    primary: bool,
+    secondary: bool,
+    alpha: bool,
+}
+
+/// the registers Lighting::read can take, the enable bit, the lights up to the config, the disable bit,
+/// how the tables get read and which light each slot holds
+const REGISTERS_READ: usize = 1 + (REG_CONFIG1 + 1 - REG_LIGHTS) + 1 + 3 + 1;
+
+/// the lighting the last draw decoded and the registers it came from, draws mostly keep those,
+/// and comparing them costs less than decoding the lights again
+#[derive(Default)]
+pub(crate) struct LastLighting {
+    read: Option<[u32; REGISTERS_READ]>,
+    lighting: Option<Lighting>,
+}
+
+impl LastLighting {
+    /// the lighting set up in the registers, None when it's off, the one kept instead of a copy
+    pub(crate) fn read(&mut self, registers: &[u32]) -> Option<&Lighting> {
+        let read = Lighting::registers_read(registers);
+        if self.read != Some(read) {
+            self.lighting = Lighting::read(registers);
+            self.read = Some(read);
+        }
+        self.lighting.as_ref()
+    }
+}
+
+/// the lighting of a draw, decoded from the registers once
+#[derive(Debug, Clone)]
+pub struct Lighting {
+    /// the lights on, the first light_count of them
+    lights: [Light; 8],
+    light_count: usize,
+    global_ambient: [f32; 3],
+    config: u32,
+    distribution0: Option<Lookup>,
+    distribution1: Option<Lookup>,
+    fresnel: Option<Lookup>,
+    reflect: [Option<Lookup>; 3],
+    spotlight: Lookup,
+    /// does fresnel replace the primary and secondary alpha
+    fresnel_primary: bool,
+    fresnel_secondary: bool,
+    clamp_highlights: bool,
+    /// does anything read the half vector, or the unit vector toward the viewer, most draws need neither and skip normalizing them
+    needs_half: bool,
+    needs_view: bool,
+    bump: Bump,
+    shadow: Option<Shadow>,
+}
+
+impl Lighting {
+    fn lights(&self) -> &[Light] {
+        &self.lights[..self.light_count]
+    }
+
+    /// the lighting set up in the registers, None when it's off
+    pub fn read(registers: &[u32]) -> Option<Lighting> {
+        if registers[REG_ENABLE] & 1 == 0 || registers[REG_DISABLE] & 1 != 0 {
+            return None;
+        }
+        let config0 = registers[REG_CONFIG0];
+        let config1 = registers[REG_CONFIG1];
+        let config = (config0 >> 4) & 0xF;
+        let absolute = registers[REG_TABLE_ABSOLUTE];
+        let inputs = registers[REG_TABLE_INPUT];
+        let scales = registers[REG_TABLE_SCALE];
+        // each table's input, abs and scale sit four bits apart, abs is a disable bit one above
+        let lookup = |field: u32| Lookup {
+            input: (inputs >> (field * 4)) & 7,
+            absolute: (absolute >> (field * 4 + 1)) & 1 == 0,
+            scale: match (scales >> (field * 4)) & 7 {
+                0 => 1.0,
+                1 => 2.0,
+                2 => 4.0,
+                3 => 8.0,
+                6 => 0.25,
+                7 => 0.5,
+                _ => 0.0,
+            },
+        };
+        let table = |table: usize, disabled: u32, field: u32| {
+            (config1 & (1 << disabled) == 0 && supported(config, table)).then(|| lookup(field))
+        };
+
+        let light_count = ((registers[REG_LIGHT_COUNT] & 7) + 1) as usize;
+        let mut lights = [Light::default(); 8];
+        for (slot, light) in lights.iter_mut().enumerate().take(light_count) {
+            let number = ((registers[REG_LIGHT_SLOTS] >> (slot * 4)) & 7) as usize;
+            let block = &registers[REG_LIGHTS + number * 0x10..REG_LIGHTS + number * 0x10 + 0x10];
+            let half = |value: u32| pica_float(value & 0xFFFF, 10, 5);
+            let position = [half(block[4]), half(block[4] >> 16), half(block[5])];
+            *light = Light {
+                specular0: color(block[0]),
+                specular1: color(block[1]),
+                diffuse: color(block[2]),
+                ambient: color(block[3]),
+                position,
+                direction: normalized(position),
+                spot: [fixed(block[6]), fixed(block[6] >> 16), fixed(block[7])],
+                directional: block[9] & 1 != 0,
+                two_sided: block[9] & 2 != 0,
+                geometric0: block[9] & 4 != 0,
+                geometric1: block[9] & 8 != 0,
+                distance: (config1 & (1 << (24 + number)) == 0)
+                    .then(|| (pica_float(block[10] & 0xF_FFFF, 12, 7), pica_float(block[11] & 0xF_FFFF, 12, 7))),
+                spotlight: config1 & (1 << (8 + number)) == 0 && supported(config, SPOTLIGHT),
+                shadowed: config1 & (1 << number) == 0,
+                number,
+            };
+        }
+        let on = &lights[..light_count];
+
+        let bump = match (config0 >> 28) & 3 {
+            1 => Bump::Normal(((config0 >> 22) & 3) as usize, config0 & (1 << 30) == 0),
+            2 => Bump::Tangent(((config0 >> 22) & 3) as usize),
+            _ => Bump::None,
+        };
+        let shadow = (config0 & 1 != 0).then_some(Shadow {
+            unit: ((config0 >> 24) & 3) as usize,
+            invert: config0 & (1 << 18) != 0,
+            primary: config0 & (1 << 16) != 0,
+            secondary: config0 & (1 << 17) != 0,
+            alpha: config0 & (1 << 19) != 0,
+        });
+
+        let distribution0 = table(DISTRIBUTION0, 16, 0);
+        let distribution1 = table(DISTRIBUTION1, 17, 1);
+        let fresnel = table(FRESNEL, 19, 3);
+        let reflect = [table(REFLECT_RED, 20, 6), table(REFLECT_GREEN, 21, 5), table(REFLECT_BLUE, 22, 4)];
+        let spotlight = lookup(2);
+
+        // the dot products the tables that get read take
+        let (mut half_input, mut view_input) = (false, false);
+        for input in [distribution0, distribution1, fresnel]
+            .into_iter()
+            .chain(reflect)
+            .flatten()
+            .chain(on.iter().any(|light| light.spotlight).then_some(spotlight))
+            .map(|lookup| lookup.input)
+        {
+            half_input |= input == 0 || input == 1 || (input == 5 && config == 8);
+            view_input |= input == 1 || input == 2;
+        }
+        let needs_half = on.iter().any(|light| light.geometric0 || light.geometric1) || half_input;
+        let needs_view = needs_half || view_input;
+
+        Some(Lighting {
+            lights,
+            light_count,
+            global_ambient: color(registers[REG_GLOBAL_AMBIENT]),
+            config,
+            distribution0,
+            distribution1,
+            fresnel,
+            reflect,
+            spotlight,
+            fresnel_primary: config0 & (1 << 2) != 0,
+            fresnel_secondary: config0 & (1 << 3) != 0,
+            clamp_highlights: config0 & (1 << 27) != 0,
+            needs_half,
+            needs_view,
+            bump,
+            shadow,
+        })
+    }
+
+    /// the registers read takes, of all the lights whichever it decodes, in their order
+    fn registers_read(registers: &[u32]) -> [u32; REGISTERS_READ] {
+        const LIGHTS: usize = REG_CONFIG1 + 1 - REG_LIGHTS;
+        let mut read = [0; REGISTERS_READ];
+        read[0] = registers[REG_ENABLE];
+        read[1..=LIGHTS].copy_from_slice(&registers[REG_LIGHTS..=REG_CONFIG1]);
+        read[LIGHTS + 1] = registers[REG_DISABLE];
+        read[LIGHTS + 2..LIGHTS + 5].copy_from_slice(&registers[REG_TABLE_ABSOLUTE..=REG_TABLE_SCALE]);
+        read[LIGHTS + 5] = registers[REG_LIGHT_SLOTS];
+        read
+    }
+
+    /// the tables the GPU reads for the lighting, a bit each, as the shader goes thru them
+    /// the lookups on, and each light's spotlight and distance tables where it has them, the ring doesn't need to hold the rest
+    pub(crate) fn tables_read(&self) -> u32 {
+        let lookups = [
+            (self.distribution0, DISTRIBUTION0),
+            (self.distribution1, DISTRIBUTION1),
+            (self.fresnel, FRESNEL),
+            (self.reflect[0], REFLECT_RED),
+            (self.reflect[1], REFLECT_GREEN),
+            (self.reflect[2], REFLECT_BLUE),
+        ];
+        let mut read = lookups.iter().filter(|(lookup, _)| lookup.is_some()).fold(0, |read, &(_, table)| read | 1 << table);
+        for light in self.lights() {
+            if light.spotlight {
+                read |= 1 << (SPOTLIGHT + light.number);
+            }
+            if light.distance.is_some() {
+                read |= 1 << (DISTANCE + light.number);
+            }
+        }
+        read
+    }
+
+    /// the lighting as the words of the hardware renderer's uniform block, in the order its shader declares them
+    pub(crate) fn pack(&self, words: &mut Vec<u32>) {
+        let bump = match self.bump {
+            Bump::None => 0,
+            Bump::Normal(unit, rebuild) => 1 | (unit as u32) << 4 | (rebuild as u32) << 8,
+            Bump::Tangent(unit) => 2 | (unit as u32) << 4,
+        };
+        let shadow = self.shadow.map_or(0, |shadow| {
+            1 | (shadow.unit as u32) << 4
+                | (shadow.invert as u32) << 8
+                | (shadow.primary as u32) << 9
+                | (shadow.secondary as u32) << 10
+                | (shadow.alpha as u32) << 11
+        });
+        words.extend([self.config, self.light_count as u32, bump, shadow]);
+        words.extend([
+            self.fresnel_primary as u32,
+            self.fresnel_secondary as u32,
+            self.clamp_highlights as u32,
+            self.needs_half as u32 | (self.needs_view as u32) << 1,
+        ]);
+        let lookup = |lookup: Option<Lookup>| {
+            lookup.map_or([0; 4], |lookup| [1, lookup.input, lookup.absolute as u32, lookup.scale.to_bits()])
+        };
+        for table in [self.distribution0, self.distribution1, self.fresnel]
+            .into_iter()
+            .chain(self.reflect)
+            .chain([Some(self.spotlight)])
+        {
+            words.extend(lookup(table));
+        }
+        let vector = |v: [f32; 3]| [v[0].to_bits(), v[1].to_bits(), v[2].to_bits(), 0];
+        words.extend(vector(self.global_ambient));
+        for slot in 0..8 {
+            let Some(light) = self.lights().get(slot) else {
+                words.extend([0; 36]);
+                continue;
+            };
+            for v in [light.specular0, light.specular1, light.diffuse, light.ambient, light.position, light.direction, light.spot] {
+                words.extend(vector(v));
+            }
+            let (bias, scale) = light.distance.unwrap_or((0.0, 0.0));
+            words.extend([bias.to_bits(), scale.to_bits(), 0, 0]);
+            let flags = light.directional as u32
+                | (light.two_sided as u32) << 1
+                | (light.geometric0 as u32) << 2
+                | (light.geometric1 as u32) << 3
+                | (light.distance.is_some() as u32) << 4
+                | (light.spotlight as u32) << 5
+                | (light.shadowed as u32) << 6;
+            words.extend([flags, light.number as u32, 0, 0]);
+        }
+    }
+
+    /// the primary and secondary fragment colors of a fragment whose surface quaternion and view vector the
+    /// vertices interpolated, textures being what the texture units sampled there
+    pub fn shade(&self, tables: &Tables, quaternion: [f32; 4], view: [f32; 3], textures: &[[f32; 4]; 4]) -> ([f32; 4], [f32; 4]) {
+        let length = quaternion.iter().map(|c| c * c).sum::<f32>().sqrt();
+        let quaternion = if length > 0.0 { quaternion.map(|c| c / length) } else { [0.0, 0.0, 0.0, 1.0] };
+
+        let shadow = self.shadow.map_or([1.0; 4], |shadow| {
+            let texel = textures[shadow.unit];
+            if shadow.invert { texel.map(|c| 1.0 - c) } else { texel }
+        });
+
+        let (surface_normal, surface_tangent) = match self.bump {
+            Bump::None => ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+            Bump::Normal(unit, rebuild) => {
+                let mut normal: [f32; 3] = std::array::from_fn(|i| textures[unit][i] * 2.0 - 1.0);
+                if rebuild {
+                    normal[2] = (1.0 - (normal[0] * normal[0] + normal[1] * normal[1])).max(0.0).sqrt();
+                }
+                (normal, [1.0, 0.0, 0.0])
+            }
+            Bump::Tangent(unit) => ([0.0, 0.0, 1.0], std::array::from_fn(|i| textures[unit][i] * 2.0 - 1.0)),
+        };
+        let normal = rotate(quaternion, surface_normal);
+        // only the last configuration has a table that reads the tangent
+        let tangent = if self.config == 8 { rotate(quaternion, surface_tangent) } else { surface_tangent };
+        let norm_view = if self.needs_view { normalized(view) } else { [0.0; 3] };
+
+        let mut diffuse_sum = [0.0, 0.0, 0.0, 1.0];
+        let mut specular_sum = [0.0, 0.0, 0.0, 1.0];
+        for (slot, light) in self.lights().iter().enumerate() {
+            let light_vector = if light.directional {
+                light.direction
+            } else {
+                normalized(std::array::from_fn(|i| light.position[i] + view[i]))
+            };
+            let (half, half_unit) = if self.needs_half {
+                let half = std::array::from_fn(|i| norm_view[i] + light_vector[i]);
+                (half, normalized(half))
+            } else {
+                ([0.0; 3], [0.0; 3])
+            };
+
+            let distance = light.distance.map_or(1.0, |(bias, scale)| {
+                let offset: [f32; 3] = std::array::from_fn(|i| -view[i] - light.position[i]);
+                let place = (scale * dot(offset, offset).sqrt() + bias).clamp(0.0, 1.0);
+                let entry = (place * 256.0).floor().clamp(0.0, 255.0);
+                tables.lookup(DISTANCE + light.number, entry as u8, place * 256.0 - entry)
+            });
+
+            let value = |lookup: Lookup, table: usize| {
+                let result = match lookup.input {
+                    0 => dot(normal, half_unit),
+                    1 => dot(norm_view, half_unit),
+                    2 => dot(normal, norm_view),
+                    3 => dot(light_vector, normal),
+                    4 => dot(light_vector, light.spot),
+                    5 if self.config == 8 => {
+                        let along = dot(normal, half_unit);
+                        dot(std::array::from_fn(|i| half_unit[i] - normal[i] * along), tangent)
+                    }
+                    _ => 0.0,
+                };
+                let (entry, delta) = if lookup.absolute {
+                    let result = if light.two_sided { result.abs() } else { result.max(0.0) };
+                    let entry = (result * 256.0).floor().clamp(0.0, 255.0);
+                    (entry as u8, result * 256.0 - entry)
+                } else {
+                    // the signed index wraps into the upper half of the table
+                    let entry = (result * 128.0).floor().clamp(-128.0, 127.0);
+                    (entry as i8 as u8, result * 128.0 - entry)
+                };
+                lookup.scale * tables.lookup(table, entry, delta)
+            };
+
+            let spot = if light.spotlight { value(self.spotlight, SPOTLIGHT + light.number) } else { 1.0 };
+            let distribution0 = self.distribution0.map_or(1.0, |lookup| value(lookup, DISTRIBUTION0));
+            let red = self.reflect[0].map_or(1.0, |lookup| value(lookup, REFLECT_RED));
+            let reflect = [
+                red,
+                self.reflect[1].map_or(red, |lookup| value(lookup, REFLECT_GREEN)),
+                self.reflect[2].map_or(red, |lookup| value(lookup, REFLECT_BLUE)),
+            ];
+            let distribution1 = self.distribution1.map_or(1.0, |lookup| value(lookup, DISTRIBUTION1));
+            let mut specular0 = light.specular0.map(|c| c * distribution0);
+            let mut specular1: [f32; 3] = std::array::from_fn(|i| distribution1 * reflect[i] * light.specular1[i]);
+
+            // only the last light applies fresnel
+            if slot == self.light_count - 1 {
+                if let Some(lookup) = self.fresnel {
+                    let fresnel = value(lookup, FRESNEL);
+                    if self.fresnel_primary {
+                        diffuse_sum[3] = fresnel;
+                    }
+                    if self.fresnel_secondary {
+                        specular_sum[3] = fresnel;
+                    }
+                }
+            }
+
+            let facing = dot(light_vector, normal);
+            let facing = if light.two_sided { facing.abs() } else { facing.max(0.0) };
+            let highlights = if self.clamp_highlights && facing == 0.0 { 0.0 } else { 1.0 };
+            if light.geometric0 || light.geometric1 {
+                let length = dot(half, half);
+                let factor = if length == 0.0 { 0.0 } else { (facing / length).min(1.0) };
+                if light.geometric0 {
+                    specular0 = specular0.map(|c| c * factor);
+                }
+                if light.geometric1 {
+                    specular1 = specular1.map(|c| c * factor);
+                }
+            }
+
+            let shadowed = |enabled: bool| {
+                if enabled && light.shadowed { [shadow[0], shadow[1], shadow[2]] } else { [1.0; 3] }
+            };
+            let shadow_primary = shadowed(self.shadow.is_some_and(|s| s.primary));
+            let shadow_secondary = shadowed(self.shadow.is_some_and(|s| s.secondary));
+            for i in 0..3 {
+                let diffuse = (light.diffuse[i] * facing + light.ambient[i]) * distance * spot;
+                let specular = (specular0[i] + specular1[i]) * highlights * distance * spot;
+                diffuse_sum[i] += diffuse * shadow_primary[i];
+                specular_sum[i] += specular * shadow_secondary[i];
+            }
+        }
+
+        if self.shadow.is_some_and(|s| s.alpha) {
+            if self.fresnel_primary {
+                diffuse_sum[3] *= shadow[3];
+            }
+            if self.fresnel_secondary {
+                specular_sum[3] *= shadow[3];
+            }
+        }
+        for (sum, ambient) in diffuse_sum.iter_mut().zip(self.global_ambient) {
+            *sum += ambient;
+        }
+        // the unit hands the combiners 8 bit colors
+        let quantize = |c: f32| ((c.clamp(0.0, 1.0) * 255.0) as u8) as f32 / 255.0;
+        (diffuse_sum.map(quantize), specular_sum.map(quantize))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the tables the GPU reads for a draw are the lookups it has on plus the spotlight and distance tables of the lights it lights w/
+    #[test]
+    fn a_draw_reads_the_tables_of_its_lookups_and_lights() {
+        let mut registers = vec![0u32; 0x200];
+        registers[REG_ENABLE] = 1;
+        // the configuration with every lookup
+        registers[REG_CONFIG0] = 8 << 4;
+        // two lights, 5 and 2, of the eight
+        registers[REG_LIGHT_COUNT] = 1;
+        registers[REG_LIGHT_SLOTS] = 0x25;
+        // the second distribution, fresnel and blue off, light 5's
+        // spotlight off and light 2's distance
+        registers[REG_CONFIG1] = 1 << 17 | 1 << 19 | 1 << 22 | 1 << (8 + 5) | 1 << (24 + 2);
+        let lighting = Lighting::read(&registers).expect("lighting on");
+        let expected = 1 << DISTRIBUTION0 | 1 << REFLECT_RED | 1 << REFLECT_GREEN | 1 << (SPOTLIGHT + 2) | 1 << (DISTANCE + 5);
+        assert_eq!(lighting.tables_read(), expected);
+    }
+
+    #[test]
+    fn half_floats_decode() {
+        assert_eq!(pica_float(0x3C00, 10, 5), 1.0);
+        assert_eq!(pica_float(0xC000, 10, 5), -2.0);
+        assert_eq!(pica_float(0x0000, 10, 5), 0.0);
+    }
+
+    #[test]
+    fn table_writes_advance_the_index() {
+        let mut registers = vec![0u32; 0x200];
+        registers[REG_TABLE_INDEX] = 3 << 8;
+        let mut tables = Tables::default();
+        tables.write(&mut registers, 4095);
+        // half of the way down, the sign sits above the step
+        tables.write(&mut registers, 2048 | ((0x800 | 0x400) << 12));
+        assert_eq!(tables.entries[3][0], [1.0, 0.0]);
+        assert_eq!(tables.entries[3][1][1], -1024.0 / 2047.0);
+        assert_eq!(registers[REG_TABLE_INDEX], (3 << 8) | 2);
+    }
+
+    /// titles send the same tables again and again, which leaves what the GPU has of them as is, only a changed entry makes it stale
+    #[test]
+    fn writes_in_one_go_leave_what_writes_one_at_a_time_do() {
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            seed
+        };
+        let (mut one, mut all) = (Tables::default(), Tables::default());
+        let (mut ones, mut alls) = (vec![0u32; 0x200], vec![0u32; 0x200]);
+        for round in 0..200 {
+            // past the end of a table, into one that doesn't exist, and the same entries again
+            let index = (random() >> 8) & 0x1FFF;
+            let values: Vec<u32> = (0..random() % 300).map(|i| if round % 3 == 0 { i * 0x1001 } else { random() }).collect();
+            ones[REG_TABLE_INDEX] = index | 0xABC0_0000;
+            alls[REG_TABLE_INDEX] = index | 0xABC0_0000;
+            values.iter().for_each(|&value| one.write(&mut ones, value));
+            let split = values.len().min(1 + round % 3);
+            all.write_all(&mut alls, [&values[..split], &values[split..]]);
+            assert_eq!(alls[REG_TABLE_INDEX], ones[REG_TABLE_INDEX], "round {round}");
+            assert_eq!((all.generation(), all.changed()), (one.generation(), one.changed()), "round {round}");
+            assert!(all.saved().iter().zip(one.saved()).all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits)), "round {round}");
+        }
+        // and the table decodes like it did w/ divisions
+        let mut registers = vec![0u32; 0x200];
+        for value in [0, 1, 0xFFF, 0x7FF000, 0x800000, 0xFFFFFF, 0x123456, 0xABCDEF] {
+            registers[REG_TABLE_INDEX] = 2 << 8;
+            one.write(&mut registers, value);
+            let step = ((value >> 12) & 0x7FF) as f32 / 2047.0;
+            let step = if value & (1 << 23) != 0 { -step } else { step };
+            let expected = [(value & 0xFFF) as f32 / 4095.0, step];
+            assert_eq!(one.entries()[2][0].map(f32::to_bits), expected.map(f32::to_bits), "{value:06X}");
+        }
+    }
+
+    #[test]
+    fn only_a_changed_entry_makes_the_tables_stale() {
+        let mut registers = vec![0u32; 0x200];
+        let mut tables = Tables::default();
+        let values = [4095, 2048 | ((0x800 | 0x400) << 12), 0];
+        registers[REG_TABLE_INDEX] = 5 << 8;
+        values.iter().for_each(|&value| tables.write(&mut registers, value));
+        let sent = tables.generation();
+        registers[REG_TABLE_INDEX] = 5 << 8;
+        values.iter().for_each(|&value| tables.write(&mut registers, value));
+        assert_eq!(tables.generation(), sent);
+        registers[REG_TABLE_INDEX] = (5 << 8) | 1;
+        let changed = *tables.changed();
+        tables.write(&mut registers, 2048);
+        assert_ne!(tables.generation(), sent);
+        // and only its own table is noted as changed
+        let mut expected = changed;
+        expected[5] = tables.generation();
+        assert_eq!(*tables.changed(), expected);
+        assert!(tables.restore(&tables.saved()));
+        assert_eq!(*tables.changed(), [tables.generation(); TABLES], "a restore changes every table");
+        assert_ne!(Tables::default().id(), tables.id());
+    }
+
+    /// the lighting kept from the last draw is the one the registers set up,
+    /// thru changes to any register it can be decoded from and to ones it can't
+    #[test]
+    fn kept_lighting_follows_the_registers() {
+        let mut seed = 3u32;
+        // the high bits, the low ones of the sequence repeat soon
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut registers = vec![0u32; 0x200];
+        registers[REG_ENABLE] = 1;
+        // all eight lights on, each slot a different one
+        registers[REG_LIGHT_COUNT] = 7;
+        registers[REG_LIGHT_SLOTS] = 0x7654_3210;
+        let read: Vec<usize> = [REG_ENABLE, REG_DISABLE, REG_LIGHT_SLOTS]
+            .into_iter()
+            .chain(REG_LIGHTS..=REG_CONFIG1)
+            .chain(REG_TABLE_ABSOLUTE..=REG_TABLE_SCALE)
+            .collect();
+        let mut kept = LastLighting::default();
+        let mut lit = 0;
+        for step in 0..4000 {
+            let register = match random() % 8 {
+                0 => (random() % 0x200) as usize,
+                // the switches and the slots often, they decide the rest
+                1 => [REG_ENABLE, REG_DISABLE, REG_LIGHT_COUNT, REG_LIGHT_SLOTS][(random() % 4) as usize],
+                _ => read[(random() as usize) % read.len()],
+            };
+            registers[register] ^= 1 << (random() % 32);
+            let fresh = Lighting::read(&registers);
+            lit += fresh.is_some() as u32;
+            assert_eq!(format!("{:?}", kept.read(&registers)), format!("{fresh:?}"), "step {step}, register {register:#X}");
+        }
+        assert!(lit > 400, "lit {lit} times");
+    }
+
+    #[test]
+    fn a_quaternion_turns_a_vector() {
+        // a quarter turn about z takes x to y
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let turned = rotate([0.0, 0.0, half, half], [1.0, 0.0, 0.0]);
+        assert!((turned[0]).abs() < 1e-6 && (turned[1] - 1.0).abs() < 1e-6);
+    }
+}
